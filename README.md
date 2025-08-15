@@ -1,9 +1,5 @@
-### `README.md`
-
-````markdown
 # Discord-Platform-Spoofer
 A minimal selfbot gateway spoofer for Discord that allows users to appear as mobile, desktop, web, or console clients. Includes auto-config creation and optional REST session support.
-
 
 > ⚠️ Warning: Selfbots and account automation may violate Discord TOS. Use at your own risk.
 
@@ -32,7 +28,7 @@ A minimal selfbot gateway spoofer for Discord that allows users to appear as mob
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/discord-platform-spoofer.git
+git clone https://github.com/KeiraOMG0/Discord-Platform-Spoofer.git
 cd discord-platform-spoofer
 ````
 
