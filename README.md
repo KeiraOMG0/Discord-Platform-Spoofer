@@ -79,13 +79,19 @@ python main.py
 
 ---
 
-## Optional: Precompiled Executable
+## Optional: Precompiled Executables
 
-You can provide a precompiled `ChedLog.exe` or your own compiled version of this script.
+This release includes precompiled versions to make setup easier:
 
-* Windows users can run `.exe` directly.
-* Linux/macOS users can use **PyInstaller** or run via Python (`python main.py`).
-* Linux users can also run Windows `.exe` via **Wine**.
+* **ChedLog.exe** – A utility to safely retrieve your Discord token. Thanks to [Cheddlar/ChedLog](https://github.com/Cheddlar/ChedLog) for making token retrieval simple.
+
+* **main.exe** – The compiled version of this platform spoofer script, which lets you appear as **Desktop, Web, Mobile, or Console** on Discord. Includes auto-config creation for token and platform.
+
+### Usage
+
+* **Windows:** Run `.exe` files directly.  
+* **Linux/macOS:** Use **PyInstaller** to compile the script yourself or run via Python (`python main.py`).  
+* **Linux users** can also run Windows `.exe` via **Wine**.
 
 ---
 
