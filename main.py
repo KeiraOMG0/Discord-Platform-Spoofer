@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 main.py
 Minimal Gateway-based platform spoofer with auto config creation.
@@ -20,60 +21,81 @@ import websockets
 import aiohttp
 
 # --- Config/token loader ---------------------------------------------------
-CONFIG_PATH = "config.json"
+CONFIG_PATH = "config.json"  # Path to config file containing token and platform
 
 # --- User-facing platforms mapping ----------------------------------------
-# User-friendly names -> actual template keys
+# Maps friendly platform names to the internal template keys
 PLATFORM_ALIAS = {
-    "desktop": "desktop",
-    "web": "web",
-    "mobile": "ios",             # mobile maps to iOS template
-    "console": "playstation"     # console maps to embedded console template
+    "desktop": "desktop",      # Standard desktop client
+    "web": "web",              # Browser client
+    "mobile": "ios",           # Mobile uses iOS template (iOS/Android merged)
+    "console": "playstation"   # Console uses embedded PlayStation template
 }
 
+# --- Config creation and loading ------------------------------------------
 def create_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
-    """Prompt user for token and platform, save to config.json"""
+    """
+    Prompt the user for a Discord token and platform choice.
+    Saves the information to a config.json file.
+    """
     print("No config.json found. Let's create one.")
-    token = input("Enter your Discord token: ").strip()
+    token = input("Enter your Discord token: ").strip()  # Prompt for token
+
+    # Prompt for platform choice
     print("Choose platform to spoof:")
     print(" - desktop")
     print(" - web")
     print(" - mobile")
     print(" - console (embed)")
     platform_input = input("Platform (default 'desktop'): ").strip().lower() or "desktop"
+
+    # Fallback to default if input invalid
     if platform_input not in PLATFORM_ALIAS:
         print("Unknown platform; defaulting to desktop")
         platform_input = "desktop"
+
     cfg = {"token": token, "platform": platform_input}
+
+    # Save config to disk
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4)
     print(f"Config saved to {path}")
     return cfg
 
 def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
-    """Load existing config.json or create new one if missing"""
+    """
+    Load an existing config.json if present,
+    otherwise create a new one.
+    """
     if not os.path.exists(path):
         return create_config(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        # If reading fails, recreate config
         return create_config(path)
 
 def load_token(cfg: Dict[str, Any]) -> Optional[str]:
+    """
+    Returns Discord token, preferring environment variable
+    over config file.
+    """
     token = os.getenv("DISCORD_TOKEN")
     if token:
         return token
     return cfg.get("token")
 
 # --- Templates for properties / UA ----------------------------------------
+# Discord "super properties" templates used for platform spoofing
 SUPER_PROPERTIES_TEMPLATES: Dict[str, Dict] = {
     "desktop": {
         "os": "Windows",
         "browser": "Discord Client",
         "device": "",
         "system_locale": "en-US",
-        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
         "client_build_number": 432290
     },
     "web": {
@@ -81,10 +103,11 @@ SUPER_PROPERTIES_TEMPLATES: Dict[str, Dict] = {
         "browser": "Discord Web",
         "device": "",
         "system_locale": "en-US",
-        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
         "client_build_number": 432290
     },
-    "ios": {
+    "ios": {  # Used for mobile
         "os": "iOS",
         "browser": "Discord iOS",
         "device": "iPhone",
@@ -108,7 +131,7 @@ SUPER_PROPERTIES_TEMPLATES: Dict[str, Dict] = {
         "browser_user_agent": "Discord/Embedded (Xbox)",
         "client_build_number": 123456
     },
-    "playstation": {
+    "playstation": {  # Used for console
         "os": "PlayStation",
         "browser": "Discord Embedded",
         "device": "PlayStation",
@@ -119,6 +142,9 @@ SUPER_PROPERTIES_TEMPLATES: Dict[str, Dict] = {
 }
 
 def encode_super_properties(obj: Dict) -> str:
+    """
+    Encode super properties to base64 as Discord expects.
+    """
     s = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
@@ -126,10 +152,13 @@ def encode_super_properties(obj: Dict) -> str:
 GATEWAY_URL = "wss://gateway.discord.gg/?v=9&encoding=json"
 
 async def heartbeat_loop(ws: websockets.WebSocketClientProtocol, interval_ms: int, get_seq_callable):
+    """
+    Sends heartbeat (op 1) at regular intervals to keep connection alive.
+    """
     interval = interval_ms / 1000.0
     try:
         while True:
-            seq = get_seq_callable()
+            seq = get_seq_callable()  # get last sequence number
             payload = {"op": 1, "d": seq}
             await ws.send(json.dumps(payload))
             await asyncio.sleep(interval)
@@ -139,11 +168,17 @@ async def heartbeat_loop(ws: websockets.WebSocketClientProtocol, interval_ms: in
         logging.getLogger("gateway_spoofer").exception("Heartbeat error: %s", exc)
 
 async def run_gateway(token: str, platform: str):
+    """
+    Connect to Discord Gateway, send IDENTIFY with spoofed platform,
+    maintain heartbeat, and optionally open REST session with spoofed headers.
+    """
     log = logging.getLogger("gateway_spoofer")
+    # Get super properties template
     props = SUPER_PROPERTIES_TEMPLATES.get(platform, SUPER_PROPERTIES_TEMPLATES["desktop"])
     encoded_props = encode_super_properties(props)
     ua = props.get("browser_user_agent")
 
+    # REST session headers in case user wants to send API requests
     rest_headers = {
         "Authorization": token,
         "X-Super-Properties": encoded_props,
@@ -151,11 +186,12 @@ async def run_gateway(token: str, platform: str):
     }
     rest_session = aiohttp.ClientSession(headers=rest_headers)
 
+    # Store last sequence for heartbeats
     last_seq_holder = {"seq": None}
-
     def get_seq():
         return last_seq_holder["seq"]
 
+    # Connect to Gateway
     async with websockets.connect(GATEWAY_URL, max_size=None) as ws:
         log.info("Connected to gateway, waiting for HELLO...")
         raw = await ws.recv()
@@ -163,8 +199,10 @@ async def run_gateway(token: str, platform: str):
         hello = msg.get("d", {})
         hb_interval = hello.get("heartbeat_interval", 41250)
 
+        # Start background heartbeat task
         hb_task = asyncio.create_task(heartbeat_loop(ws, hb_interval, get_seq))
 
+        # Build IDENTIFY payload
         identify_payload = {
             "op": 2,
             "d": {
@@ -175,27 +213,30 @@ async def run_gateway(token: str, platform: str):
                     "device": props.get("device", ""),
                 },
                 "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
-                "intents": 0
+                "intents": 0  # selfbots shouldn't request privileged intents
             }
         }
         await ws.send(json.dumps(identify_payload))
         log.info("IDENTIFY sent with properties: %s", identify_payload["d"]["properties"])
 
         try:
+            # Listen for incoming messages
             while True:
                 raw = await ws.recv()
                 msg = json.loads(raw)
                 if msg.get("s") is not None:
-                    last_seq_holder["seq"] = msg["s"]
+                    last_seq_holder["seq"] = msg["s"]  # update last seq
                 op = msg.get("op")
                 t = msg.get("t")
                 if op == 0 and t == "READY":
+                    # READY event confirms successful login
                     user = msg.get("d", {}).get("user", {})
                     log.info("READY received. logged in as: %s (id=%s)", user.get("username"), user.get("id"))
                 if op == 9:
                     log.warning("Invalid session. server asked to reconnect.")
                     break
                 if op == 1:
+                    # Server requested heartbeat
                     await ws.send(json.dumps({"op": 1, "d": last_seq_holder["seq"]}))
         except websockets.exceptions.ConnectionClosed as e:
             log.info("Connection closed: %s", e)
@@ -205,6 +246,10 @@ async def run_gateway(token: str, platform: str):
 
 # --- Main ------------------------------------------------------------------
 def main():
+    """
+    Load configuration, map user-friendly platform to template,
+    and start the async Gateway connection.
+    """
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
     cfg = load_config()
     token = load_token(cfg)
@@ -212,14 +257,15 @@ def main():
         print("No token found. Set DISCORD_TOKEN or add config.json with {'token': '...'}")
         return
 
+    # Read platform and map to internal template
     platform_input = cfg.get("platform", "desktop").lower()
     if platform_input not in PLATFORM_ALIAS:
         print("Unknown platform in config.json; defaulting to desktop")
         platform_input = "desktop"
 
-    # Map user-friendly platform to template
     platform_template = PLATFORM_ALIAS[platform_input]
 
+    # Run the Gateway loop
     asyncio.run(run_gateway(token, platform_template))
 
 if __name__ == "__main__":
