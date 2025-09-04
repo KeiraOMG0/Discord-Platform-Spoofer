@@ -1,272 +1,243 @@
-#!/usr/bin/env python3
-"""
-main.py
-Minimal Gateway-based platform spoofer with auto config creation.
-
-- If config.json is missing, prompts for token and platform and saves it.
-- Platforms exposed to user: desktop, web, mobile, console.
-- Connects to Discord Gateway, sends IDENTIFY with spoofed properties.
-- Maintains heartbeat, provides aiohttp session for REST if needed.
-
-WARNING: Don't post your token anywhere. Selfbots/spoofing may violate Discord TOS.
-"""
-
 import os
+import sys
 import json
-import base64
 import asyncio
 import logging
-from typing import Dict, Optional, Any
 import websockets
 import aiohttp
+import signal
+import ssl
+import http.client
+import re
+import pickle
+from urllib.parse import urlparse
+from datetime import datetime, timedelta
+import base64
 
-# --- Config/token loader ---------------------------------------------------
-CONFIG_PATH = "config.json"  # Path to config file containing token and platform
+# --- Config / cache ---
+CONFIG_PATH = "config.json"
+CACHE_FILE = "build_cache.pkl"
+CACHE_DURATION_DAYS = 7
+stop_flag = False
+current_tasks = []
 
-# --- User-facing platforms mapping ----------------------------------------
-# Maps friendly platform names to the internal template keys
-PLATFORM_ALIAS = {
-    "desktop": "desktop",      # Standard desktop client
-    "web": "web",              # Browser client
-    "mobile": "ios",           # Mobile uses iOS template (iOS/Android merged)
-    "console": "playstation"   # Console uses embedded PlayStation template
-}
+# --- Signal handling ---
+def signal_handler(sig, frame):
+    global stop_flag
+    print(f"[INFO] Received signal {sig}, shutting down...")
+    sys.stdout.flush()
+    stop_flag = True
+    for task in current_tasks:
+        if not task.done():
+            task.cancel()
 
-# --- Config creation and loading ------------------------------------------
-def create_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
-    """
-    Prompt the user for a Discord token and platform choice.
-    Saves the information to a config.json file.
-    """
-    print("No config.json found. Let's create one.")
-    token = input("Enter your Discord token: ").strip()  # Prompt for token
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+if os.name == "nt":
+    signal.signal(signal.SIGBREAK, signal_handler)
 
-    # Prompt for platform choice
-    print("Choose platform to spoof:")
-    print(" - desktop")
-    print(" - web")
-    print(" - mobile")
-    print(" - console (embed)")
-    platform_input = input("Platform (default 'desktop'): ").strip().lower() or "desktop"
+# --- HTTP request helper ---
+class reqresp:
+    def __init__(self, status, data):
+        self.status_code = status
+        self._data = data
+    @property
+    def text(self):
+        try:
+            return self._data.decode('utf-8')
+        except UnicodeDecodeError:
+            return self._data
+    def json(self):
+        try:
+            return json.loads(self._data.decode('utf-8'))
+        except:
+            return None
+    @property
+    def content(self):
+        return self._data
 
-    # Fallback to default if input invalid
-    if platform_input not in PLATFORM_ALIAS:
-        print("Unknown platform; defaulting to desktop")
-        platform_input = "desktop"
+class requesters:
+    @staticmethod
+    def request(method, url, headers=None, json_data=None):
+        if headers is None:
+            headers = {}
+        parsed_url = urlparse(url)
+        host = parsed_url.netloc
+        endpoint = parsed_url.path
+        if parsed_url.query:
+            endpoint += '?' + parsed_url.query
+        if parsed_url.scheme == "https":
+            conn = http.client.HTTPSConnection(host, context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(host)
+        body = None
+        if json_data:
+            body = json.dumps(json_data)
+            headers['Content-Type'] = 'application/json'
+        try:
+            conn.request(method, endpoint, body=body, headers=headers)
+            res = conn.getresponse()
+            data = res.read()
+            conn.close()
+            return reqresp(res.status, data)
+        except Exception:
+            return reqresp(500, b"")
 
-    cfg = {"token": token, "platform": platform_input}
+    @staticmethod
+    def get(url, headers=None):
+        return requesters.request("GET", url, headers=headers)
 
-    # Save config to disk
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
-    print(f"Config saved to {path}")
-    return cfg
-
-def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
-    """
-    Load an existing config.json if present,
-    otherwise create a new one.
-    """
-    if not os.path.exists(path):
-        return create_config(path)
+# --- Build number caching ---
+def load_cached_build():
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        # If reading fails, recreate config
-        return create_config(path)
+        with open(CACHE_FILE, 'rb') as f:
+            return pickle.load(f)
+    except:
+        return None, None
 
-def load_token(cfg: Dict[str, Any]) -> Optional[str]:
-    """
-    Returns Discord token, preferring environment variable
-    over config file.
-    """
-    token = os.getenv("DISCORD_TOKEN")
-    if token:
-        return token
-    return cfg.get("token")
+def save_cached_build(build_number):
+    try:
+        with open(CACHE_FILE, 'wb') as f:
+            pickle.dump((build_number, datetime.now()), f)
+    except:
+        pass
 
-# --- Templates for properties / UA ----------------------------------------
-# Discord "super properties" templates used for platform spoofing
-SUPER_PROPERTIES_TEMPLATES: Dict[str, Dict] = {
-    "desktop": {
-        "os": "Windows",
-        "browser": "Discord Client",
-        "device": "",
-        "system_locale": "en-US",
-        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-        "client_build_number": 432290
-    },
-    "web": {
-        "os": "Windows",
-        "browser": "Discord Web",
-        "device": "",
-        "system_locale": "en-US",
-        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-        "client_build_number": 432290
-    },
-    "ios": {  # Used for mobile
-        "os": "iOS",
-        "browser": "Discord iOS",
-        "device": "iPhone",
-        "system_locale": "en-US",
-        "browser_user_agent": "Discord/2024.0 (iPhone; iOS 16.6; Scale/3.00)",
-        "client_build_number": 123456
-    },
-    "android": {
-        "os": "Android",
-        "browser": "Discord Android",
-        "device": "Android Phone",
-        "system_locale": "en-US",
-        "browser_user_agent": "Discord/2024.0 (Android 13; Pixel 6)",
-        "client_build_number": 123456
-    },
-    "xbox": {
-        "os": "Xbox",
-        "browser": "Discord Embedded",
-        "device": "Xbox",
-        "system_locale": "en-US",
-        "browser_user_agent": "Discord/Embedded (Xbox)",
-        "client_build_number": 123456
-    },
-    "playstation": {  # Used for console
-        "os": "PlayStation",
-        "browser": "Discord Embedded",
-        "device": "PlayStation",
-        "system_locale": "en-US",
-        "browser_user_agent": "Discord/Embedded (PlayStation)",
-        "client_build_number": 123456
-    }
+def extract_asset_files():
+    req = requesters.get("https://discord.com/login")
+    pattern = r'<script\s+src="([^"]+\.js)"\s+defer>\s*</script>'
+    return re.findall(pattern, req.text)
+
+def get_live_build_number():
+    try:
+        files = extract_asset_files()
+        for file in files:
+            url = f"https://discord.com{file}"
+            resp = requesters.get(url)
+            if "buildNumber" in resp.text:
+                return int(resp.text.split('buildNumber:"')[1].split('"')[0])
+    except:
+        pass
+    return None
+
+def get_current_build_number():
+    cached, timestamp = load_cached_build()
+    if cached and timestamp and datetime.now() - timestamp < timedelta(days=CACHE_DURATION_DAYS):
+        return cached
+    new_build = get_live_build_number()
+    if new_build:
+        save_cached_build(new_build)
+        return new_build
+    if cached:
+        return cached
+    return 432290  # fallback
+
+# --- Load config ---
+def load_config(path=CONFIG_PATH):
+    if not os.path.exists(path):
+        token = input("Enter your Discord token: ").strip()
+        platform = input("Platform (desktop/web/mobile/console, default desktop): ").strip().lower() or "desktop"
+        cfg = {"token": token, "platform": platform}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        return cfg
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def load_token(cfg):
+    return os.getenv("DISCORD_TOKEN") or cfg.get("token")
+
+# --- Super properties ---
+CURRENT_BUILD = get_current_build_number()
+SUPER_PROPERTIES = {
+    "desktop": {"os":"Windows","browser":"Discord Client","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0","client_build_number":CURRENT_BUILD},
+    "web": {"os":"Windows","browser":"Discord Web","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0","client_build_number":CURRENT_BUILD},
+    "ios": {"os":"iOS","browser":"Discord iOS","device":"iPhone","system_locale":"en-US","browser_user_agent":"Discord/2024.0 (iPhone; iOS 16.6; Scale/3.00)","client_build_number":CURRENT_BUILD},
+    "playstation": {"os":"PlayStation","browser":"Discord Embedded","device":"PlayStation","system_locale":"en-US","browser_user_agent":"Discord/Embedded (PlayStation)","client_build_number":CURRENT_BUILD}
 }
 
-def encode_super_properties(obj: Dict) -> str:
-    """
-    Encode super properties to base64 as Discord expects.
-    """
+DISPLAY_NAMES = {"playstation":"console","ios":"mobile","desktop":"desktop","web":"web"}
+
+def encode_super_properties(obj):
     s = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
-# --- Gateway logic ---------------------------------------------------------
+# --- Gateway ---
 GATEWAY_URL = "wss://gateway.discord.gg/?v=9&encoding=json"
 
-async def heartbeat_loop(ws: websockets.WebSocketClientProtocol, interval_ms: int, get_seq_callable):
-    """
-    Sends heartbeat (op 1) at regular intervals to keep connection alive.
-    """
+async def heartbeat_loop(ws, interval_ms, get_seq):
     interval = interval_ms / 1000.0
     try:
-        while True:
-            seq = get_seq_callable()  # get last sequence number
-            payload = {"op": 1, "d": seq}
-            await ws.send(json.dumps(payload))
+        while not stop_flag:
+            await ws.send(json.dumps({"op":1,"d":get_seq()}))
             await asyncio.sleep(interval)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
         return
-    except Exception as exc:
-        logging.getLogger("gateway_spoofer").exception("Heartbeat error: %s", exc)
 
-async def run_gateway(token: str, platform: str):
-    """
-    Connect to Discord Gateway, send IDENTIFY with spoofed platform,
-    maintain heartbeat, and optionally open REST session with spoofed headers.
-    """
+async def run_gateway(token, platform):
     log = logging.getLogger("gateway_spoofer")
-    # Get super properties template
-    props = SUPER_PROPERTIES_TEMPLATES.get(platform, SUPER_PROPERTIES_TEMPLATES["desktop"])
+    props = SUPER_PROPERTIES.get(platform, SUPER_PROPERTIES["desktop"])
     encoded_props = encode_super_properties(props)
     ua = props.get("browser_user_agent")
+    headers = {"Authorization": token, "X-Super-Properties": encoded_props, "User-Agent": ua}
+    session = aiohttp.ClientSession(headers=headers)
+    last_seq = {"seq": None}
+    def get_seq(): return last_seq["seq"]
 
-    # REST session headers in case user wants to send API requests
-    rest_headers = {
-        "Authorization": token,
-        "X-Super-Properties": encoded_props,
-        "User-Agent": ua or "DiscordBot (https://example, 1.0)"
-    }
-    rest_session = aiohttp.ClientSession(headers=rest_headers)
+    hb_task = None
+    platform_display = DISPLAY_NAMES.get(platform, platform)
 
-    # Store last sequence for heartbeats
-    last_seq_holder = {"seq": None}
-    def get_seq():
-        return last_seq_holder["seq"]
+    try:
+        async with websockets.connect(GATEWAY_URL, max_size=None, ping_interval=None) as ws:
+            raw = await ws.recv()
+            hello = json.loads(raw).get("d", {})
+            hb_task = asyncio.create_task(heartbeat_loop(ws, hello.get("heartbeat_interval", 41250), get_seq))
+            current_tasks.append(hb_task)
 
-    # Connect to Gateway
-    async with websockets.connect(GATEWAY_URL, max_size=None) as ws:
-        log.info("Connected to gateway, waiting for HELLO...")
-        raw = await ws.recv()
-        msg = json.loads(raw)
-        hello = msg.get("d", {})
-        hb_interval = hello.get("heartbeat_interval", 41250)
-
-        # Start background heartbeat task
-        hb_task = asyncio.create_task(heartbeat_loop(ws, hb_interval, get_seq))
-
-        # Build IDENTIFY payload
-        identify_payload = {
-            "op": 2,
-            "d": {
-                "token": token,
-                "properties": {
-                    "os": props.get("os", ""),
-                    "browser": props.get("browser", ""),
-                    "device": props.get("device", ""),
-                },
-                "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
-                "intents": 0  # selfbots shouldn't request privileged intents
+            identify_payload = {
+                "op": 2,
+                "d": {"token": token,"properties":{"os":props.get("os"),"browser":props.get("browser"),"device":props.get("device")}, "intents":0}
             }
-        }
-        await ws.send(json.dumps(identify_payload))
-        log.info("IDENTIFY sent with properties: %s", identify_payload["d"]["properties"])
+            await ws.send(json.dumps(identify_payload))
+            log.info(f"IDENTIFY sent for platform: {platform_display} (build: {CURRENT_BUILD})")
 
-        try:
-            # Listen for incoming messages
-            while True:
-                raw = await ws.recv()
-                msg = json.loads(raw)
-                if msg.get("s") is not None:
-                    last_seq_holder["seq"] = msg["s"]  # update last seq
-                op = msg.get("op")
-                t = msg.get("t")
-                if op == 0 and t == "READY":
-                    # READY event confirms successful login
-                    user = msg.get("d", {}).get("user", {})
-                    log.info("READY received. logged in as: %s (id=%s)", user.get("username"), user.get("id"))
-                if op == 9:
-                    log.warning("Invalid session. server asked to reconnect.")
+            while not stop_flag:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1)
+                    msg = json.loads(raw)
+                    if msg.get("s") is not None:
+                        last_seq["seq"] = msg["s"]
+                    if msg.get("op") == 0 and msg.get("t") == "READY":
+                        user = msg.get("d", {}).get("user", {})
+                        log.info(f"Logged in: {user.get('username')} (ID: {user.get('id')}) on {platform_display}")
+                    if msg.get("op") == 9:
+                        log.warning("Invalid session, exiting...")
+                        break
+                except asyncio.TimeoutError:
+                    continue
+                except websockets.exceptions.ConnectionClosed:
+                    log.info("WebSocket closed")
                     break
-                if op == 1:
-                    # Server requested heartbeat
-                    await ws.send(json.dumps({"op": 1, "d": last_seq_holder["seq"]}))
-        except websockets.exceptions.ConnectionClosed as e:
-            log.info("Connection closed: %s", e)
-        finally:
+    finally:
+        if hb_task and not hb_task.done():
             hb_task.cancel()
-            await rest_session.close()
+            try: await hb_task
+            except asyncio.CancelledError: pass
+        await session.close()
+        log.info("Disconnected")
 
-# --- Main ------------------------------------------------------------------
+# --- Main ---
 def main():
-    """
-    Load configuration, map user-friendly platform to template,
-    and start the async Gateway connection.
-    """
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s")
     cfg = load_config()
     token = load_token(cfg)
     if not token:
-        print("No token found. Set DISCORD_TOKEN or add config.json with {'token': '...'}")
+        print("No token found in config.json or DISCORD_TOKEN env")
         return
-
-    # Read platform and map to internal template
-    platform_input = cfg.get("platform", "desktop").lower()
-    if platform_input not in PLATFORM_ALIAS:
-        print("Unknown platform in config.json; defaulting to desktop")
+    platform_input = cfg.get("platform","desktop").lower()
+    if platform_input not in ["desktop","web","mobile","console"]:
         platform_input = "desktop"
-
-    platform_template = PLATFORM_ALIAS[platform_input]
-
-    # Run the Gateway loop
-    asyncio.run(run_gateway(token, platform_template))
+    template_platform = "ios" if platform_input=="mobile" else ("playstation" if platform_input=="console" else platform_input)
+    asyncio.run(run_gateway(token, template_platform))
 
 if __name__ == "__main__":
     main()
